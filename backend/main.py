@@ -40,6 +40,30 @@ db_pool = psycopg2.pool.SimpleConnectionPool(
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+# In-memory cache for video analysis results
+video_analysis_cache = {}
+
+# In-memory cache for complete search results
+search_results_cache = {}
+
+def cleanup_cache():
+    """Remove cache entries older than 1 hour to prevent memory issues"""
+    current_time = datetime.now()
+    cache_size_before = len(video_analysis_cache)
+    
+    keys_to_remove = []
+    for key, value in video_analysis_cache.items():
+        # Remove entries older than 1 hour
+        if (current_time - value['timestamp']).total_seconds() > 3600:
+            keys_to_remove.append(key)
+    
+    for key in keys_to_remove:
+        del video_analysis_cache[key]
+    
+    cache_size_after = len(video_analysis_cache)
+    if cache_size_before != cache_size_after:
+        print(f"[CACHE] Cleaned up {cache_size_before - cache_size_after} old cache entries. Current cache size: {cache_size_after}")
+
 class SearchQuery(BaseModel):
     query: str
 
@@ -188,6 +212,13 @@ def analyze_semantics(query, video):
     video_id = video['id']
     video_url = video['url']
     
+    # Check cache first
+    cache_key = f"{video_id}"
+    if cache_key in video_analysis_cache:
+        print(f"[CACHE] Found cached analysis for video: {video['title']}")
+        cached_data = video_analysis_cache[cache_key]
+        return cached_data['confidence'], cached_data['reason']
+    
     print(f"\n[ANALYSIS] Processing video: {video['title']}")
     
     try:
@@ -216,12 +247,14 @@ def analyze_semantics(query, video):
         """
         
         # Try different Gemini model formats with fallback
-        # Using stable available models from the API
+        # Using currently available models from the API
         model_attempts = [
-            "gemini-2.5-flash",        # Stable flash model (without models/ prefix)
-            "gemini-2.5-pro",          # Stable pro model
-            "gemini-flash-latest",     # Latest flash
-            "gemini-pro-latest",       # Latest pro
+            "gemini-3.6-flash",        # Latest flash model
+            "gemini-3.1-pro-preview",  # Latest pro preview
+            "gemini-1.5-flash",        # Stable flash model
+            "gemini-1.5-pro",          # Stable pro model
+            "gemini-flash-latest",     # Latest flash alias
+            "gemini-pro-latest",       # Latest pro alias
         ]
         
         result_text = None
@@ -254,6 +287,15 @@ def analyze_semantics(query, video):
                     reason = line.split(':', 1)[1].strip()
             
             print(f"[SUCCESS] Analysis complete - Confidence: {confidence}%")
+            
+            # Cache the results for future searches
+            video_analysis_cache[cache_key] = {
+                'confidence': confidence,
+                'reason': reason,
+                'timestamp': datetime.now()
+            }
+            print(f"[CACHE] Cached analysis for video: {video['title']}")
+            
             return confidence, reason
         else:
             raise Exception("All Gemini models failed")
@@ -263,6 +305,15 @@ def analyze_semantics(query, video):
         # Fallback to title-based matching
         confidence = random.randint(70, 90)
         reason = f"Matched based on title relevance to '{query}'. Content analysis unavailable due to AI service limitations."
+        
+        # Cache the fallback results too
+        video_analysis_cache[cache_key] = {
+            'confidence': confidence,
+            'reason': reason,
+            'timestamp': datetime.now()
+        }
+        print(f"[CACHE] Cached fallback analysis for video: {video['title']}")
+        
         return confidence, reason
 def save_search_history(query):
     conn = db_pool.getconn()
@@ -279,6 +330,17 @@ def save_search_history(query):
 @app.post("/api/search")
 async def search_videos(payload: SearchQuery):
     query = payload.query.lower()
+    
+    # Check search results cache first
+    if query in search_results_cache:
+        print(f"[CACHE] Found cached search results for query: '{query}'")
+        cached_data = search_results_cache[query]
+        # Update timestamp
+        cached_data['timestamp'] = datetime.now()
+        return {"results": cached_data['results'], "cached": True}
+    
+    # Clean up old cache entries periodically
+    cleanup_cache()
     
     # Offload the blocking YouTube API call to thread pool
     youtube_results = await run_in_threadpool(fetch_youtube_videos, query)
@@ -298,6 +360,13 @@ async def search_videos(payload: SearchQuery):
 
     # Offload the blocking DB call to thread pool
     await run_in_threadpool(save_search_history, query)
+    
+    # Cache the complete search results
+    search_results_cache[query] = {
+        'results': final_results,
+        'timestamp': datetime.now()
+    }
+    print(f"[CACHE] Cached search results for query: '{query}'")
 
     return {"results": final_results}
 
@@ -356,6 +425,21 @@ async def search_videos_stream(payload: SearchQuery):
     
     async def event_generator():
         query = payload.query.lower()
+        
+        # Check search results cache first
+        if query in search_results_cache:
+            print(f"[CACHE] Found cached search results for query: '{query}'")
+            cached_data = search_results_cache[query]
+            cached_data['timestamp'] = datetime.now()
+            
+            # Send cached results quickly
+            yield f"data: {json.dumps({'status': 'cached', 'message': 'Using cached results...'})}\n\n"
+            await asyncio.sleep(0.2)
+            yield f"data: {json.dumps({'status': 'complete', 'results': cached_data['results'], 'cached': True})}\n\n"
+            return
+        
+        # Clean up old cache entries periodically
+        cleanup_cache()
         
         # Send initial status
         yield f"data: {json.dumps({'status': 'starting', 'message': 'Initializing search...'})}\n\n"
